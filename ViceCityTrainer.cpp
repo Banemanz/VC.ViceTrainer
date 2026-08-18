@@ -18,8 +18,8 @@
       LShift         Fast move
 
     Notes:
-      - Vehicle spawning follows VC's own VehicleCheat pattern: RequestModel(flag=1),
-        LoadAllRequestedModels(false), construct, then CWorld::Add.
+      - Vehicle streaming follows VC's VehicleCheat request pattern. Lifetime/placement
+        follows VC's CREATE_CAR mission-entity path so trainer spawns do not get culled.
       - "Unlimited Ammo" keeps reserve ammo full but preserves normal reloads.
       - "No Reload" also keeps the clip full and clears reload/out-of-ammo states.
 
@@ -55,6 +55,9 @@
 #include "CAutomobile.h"
 #include "CBike.h"
 #include "CBoat.h"
+#include "CTheScripts.h"
+#include "CCarCtrl.h"
+#include "CTheZones.h"
 #include "CTimer.h"
 #include "CPathFind.h"
 #include "CPathNode.h"
@@ -166,6 +169,15 @@ static AmmoSlotSnapshot gAmmo[10];
 static bool gKeyNow[256] = {};
 static bool gKeyPrev[256] = {};
 static bool gKeysInitialised = false;
+
+// VehicleCheat(int) is authoritative for ordinary automobile creation.  The SDK's
+// vehicleCtorEvent fires synchronously from CVehicle::CVehicle, so while the native
+// cheat is running we remember the exact instance it allocates.  After VehicleCheat
+// returns (the object is fully constructed and already in CWorld), we can convert its
+// lifetime from RANDOM_VEHICLE to the same mission-owned/locked semantics used by
+// CREATE_CAR without guessing pool slots or scanning the world.
+static bool gCaptureNativeVehicleCtor = false;
+static CVehicle* gCapturedNativeVehicle = nullptr;
 
 // Uniform UI scale prevents 16:9 resolutions from stretching a 640-wide menu into
 // something enormous.  Coordinates are still authored against VC's 640x448 space.
@@ -490,9 +502,7 @@ static void RepairVehicle() {
     const int appearance = vehicle->GetVehicleAppearance();
     if (appearance == VEHICLE_APPEARANCE_BIKE) {
         static_cast<CBike*>(vehicle)->Fix();
-    } else if (appearance == VEHICLE_APPEARANCE_AUTOMOBILE ||
-               appearance == VEHICLE_APPEARANCE_HELI ||
-               appearance == VEHICLE_APPEARANCE_PLANE) {
+    } else if (appearance == VEHICLE_APPEARANCE_AUTOMOBILE) {
         static_cast<CAutomobile*>(vehicle)->Fix();
     }
 
@@ -551,9 +561,10 @@ static void LoadPosition() {
 }
 
 static CVehicle* ConstructVehicle(const VehicleEntry& entry) {
-    // Trainer-created vehicles must not enter the normal random-traffic cleanup path.
-    // VC's eVehicleCreatedBy value 4 is explicitly PERMANENT_VEHICLE.
-    constexpr unsigned char createdBy = PERMANENT_VEHICLE;
+    // VC's CREATE_CAR opcode constructs script-owned vehicles with createdBy == 2.
+    // CVehicle::CanBeDeleted() explicitly returns false for MISSION_VEHICLE, and the
+    // opcode also sets the script-lock bit below before CWorld::Add.
+    constexpr unsigned char createdBy = MISSION_VEHICLE;
 
     switch (entry.kind) {
     case VehicleKind::Bike:
@@ -566,39 +577,117 @@ static CVehicle* ConstructVehicle(const VehicleEntry& entry) {
     }
 }
 
-static bool FindVehicleCheatSpawnPoint(CVector& out) {
-    // This follows VC's own VehicleCheat(int) at 0x4AE8F0:
-    //   FindPlayerCoors -> ThePaths.FindNodeClosestToCoors(..., 100.0f, false...)
-    //   node XYZ / 8.0 -> Z + 4.0f.
-    const CVector playerPos = FindPlayerCoors();
-    const int node = ThePaths.FindNodeClosestToCoors(
-        playerPos, 0, 100.0f, false, false, false, false);
+static CVector GetVehicleSpawnCandidate() {
+    CEntity* anchor = FindPlayerVehicle() ? static_cast<CEntity*>(FindPlayerVehicle())
+                                          : static_cast<CEntity*>(FindPlayerPed());
+    if (!anchor)
+        return CVector(0.0f, 0.0f, 0.0f);
 
-    if (node >= 0) {
-        out = ThePaths.nodes[node].GetPosition();
-        out.z += 4.0f;
+    const float yaw = HeadingRadians(anchor);
+    const CVector forward(-std::sin(yaw), std::cos(yaw), 0.0f);
+    CVector pos = anchor->GetPosition();
+
+    // Put the new vehicle in front of the player rather than directly on top of them.
+    pos.x += forward.x * 6.0f;
+    pos.y += forward.y * 6.0f;
+    return pos;
+}
+
+static bool ResolveVehicleSpawnPosition(CVehicle* vehicle, CVector& pos) {
+    if (!vehicle)
+        return false;
+
+    // This is the important part of VC's CREATE_CAR implementation at 0x44A1F3:
+    // resolve ground, then add CEntity::GetDistanceFromCentreOfMassToBaseOfModel().
+    // That places the collision model's base on the surface instead of putting its
+    // matrix origin at ground Z (the cause of the old half-underground spawns).
+    bool foundGround = false;
+    const float probeZ = pos.z + 30.0f;
+    const float groundZ = CWorld::FindGroundZFor3DCoord(
+        pos.x, pos.y, probeZ, &foundGround);
+
+    if (!foundGround) {
+        // Road-node fallback, using the same path query as VehicleCheat(int).
+        const CVector playerPos = FindPlayerCoors();
+        const int node = ThePaths.FindNodeClosestToCoors(
+            playerPos, 0, 100.0f, false, false, false, false);
+        if (node >= 0) {
+            const CVector road = ThePaths.nodes[node].GetPosition();
+            pos.x = road.x;
+            pos.y = road.y;
+            pos.z = road.z + vehicle->GetDistanceFromCentreOfMassToBaseOfModel() + 0.20f;
+            return true;
+        }
+
+        // Last-resort placement: keep it above the player's current Z rather than
+        // abandoning a fully constructed pooled vehicle before it reaches CWorld.
+        pos.z += vehicle->GetDistanceFromCentreOfMassToBaseOfModel() + 2.0f;
         return true;
     }
 
-    // Defensive fallback for interiors / unusual path coverage.  Query from above the
-    // player so the ground search cannot select a surface below an already-low origin.
-    bool foundGround = false;
-    const float groundZ = CWorld::FindGroundZFor3DCoord(
-        playerPos.x, playerPos.y, playerPos.z + 25.0f, &foundGround);
-    out = playerPos;
-    out.z = foundGround ? groundZ + 4.0f : playerPos.z + 4.0f;
-    return foundGround;
+    pos.z = groundZ + vehicle->GetDistanceFromCentreOfMassToBaseOfModel() + 0.20f;
+    return true;
 }
 
 static void SpawnVehicle(const VehicleEntry& entry) {
+    // For actual cars, delegate to VC 1.0's own VehicleCheat(int).  This is the
+    // executable-authoritative construction/lifetime path and removes every trainer-side
+    // allocator/status/autopilot variable from the equation.
+    if (entry.kind == VehicleKind::Automobile) {
+        // VC 1.0 EN VehicleCheat starts with: 53 56 57 B9 20 B2 94 00.
+        // Guard the hardcoded call so a different executable revision falls through to
+        // the mission-vehicle implementation instead of jumping into unrelated code.
+        static const unsigned char kVehicleCheatSig[8] =
+            { 0x53, 0x56, 0x57, 0xB9, 0x20, 0xB2, 0x94, 0x00 };
+        if (std::memcmp(reinterpret_cast<const void*>(0x4AE8F0),
+                        kVehicleCheatSig, sizeof(kVehicleCheatSig)) == 0) {
+            using VehicleCheatFn = void (__cdecl *)(int);
+
+            gCapturedNativeVehicle = nullptr;
+            gCaptureNativeVehicleCtor = true;
+            reinterpret_cast<VehicleCheatFn>(0x4AE8F0)(entry.model);
+            gCaptureNativeVehicleCtor = false;
+
+            // VehicleCheat deliberately creates RANDOM_VEHICLE (1).  That is fine for
+            // the stock one-off cheat, but trainer spawns should remain until the user
+            // or game explicitly destroys them.  Reclassify the *actual* instance the
+            // native routine created and rebalance CCarCtrl's per-createdBy counters so
+            // the destructor later decrements the same bucket we increment here.
+            if (gCapturedNativeVehicle && gCapturedNativeVehicle->m_nModelIndex == entry.model) {
+                CVehicle* vehicle = gCapturedNativeVehicle;
+                CCarCtrl::UpdateCarCount(vehicle, true);
+                vehicle->m_nCreatedBy = MISSION_VEHICLE;
+                vehicle->bIsLocked = true;
+                vehicle->b19 = true;
+                vehicle->bRemoveFromWorld = false;
+                vehicle->m_eDoorLock = DOORLOCK_UNLOCKED;
+                vehicle->m_nState = 4; // STATUS_ABANDONED, exactly as VehicleCheat sets it.
+                CCarCtrl::UpdateCarCount(vehicle, false);
+
+                char msg[96];
+                std::snprintf(msg, sizeof(msg), "Spawned %s [native+locked]", entry.name);
+                Notify(msg);
+            } else {
+                // If this ever appears, the executable's native cheat ran but the ctor hook
+                // did not identify its instance.  That is a useful revision/hook diagnostic.
+                char msg[96];
+                std::snprintf(msg, sizeof(msg), "Spawned %s [native/capture failed]", entry.name);
+                Notify(msg);
+            }
+            return;
+        }
+    }
+
     CPlayerPed* player = FindPlayerPed();
     if (!player) {
         Notify("Player not ready");
         return;
     }
 
-    const bool wasAlreadyRequested = (CStreaming::ms_aInfoForModel[entry.model].m_nFlags & 1) != 0;
+    const bool wasAlreadyRequested =
+        (CStreaming::ms_aInfoForModel[entry.model].m_nFlags & 1) != 0;
 
+    // Same temporary streaming request used by VC's own VehicleCheat(int).
     CStreaming::RequestModel(entry.model, 1);
     CStreaming::LoadAllRequestedModels(false);
 
@@ -611,41 +700,78 @@ static void SpawnVehicle(const VehicleEntry& entry) {
         return;
     }
 
-    // Match the original VehicleCheat ordering: release our temporary streaming request
-    // before creating the instance.  Calling these after CWorld::Add can race the next
-    // streaming update against a just-created trainer vehicle.
-    if (!wasAlreadyRequested) {
-        CStreaming::SetModelIsDeletable(entry.model);
-        CStreaming::SetModelTxdIsDeletable(entry.model);
-    }
-
-    CVector spawnPos;
-    if (!FindVehicleCheatSpawnPoint(spawnPos)) {
-        Notify("No safe vehicle spawn point");
-        return;
-    }
-
     CVehicle* vehicle = ConstructVehicle(entry);
     if (!vehicle) {
+        if (!wasAlreadyRequested) {
+            CStreaming::SetModelIsDeletable(entry.model);
+            CStreaming::SetModelTxdIsDeletable(entry.model);
+        }
         Notify("Vehicle allocation failed");
         return;
     }
 
+    CVector spawnPos = GetVehicleSpawnCandidate();
+    ResolveVehicleSpawnPosition(vehicle, spawnPos);
+
     CEntity* anchor = FindPlayerVehicle() ? static_cast<CEntity*>(FindPlayerVehicle())
                                           : static_cast<CEntity*>(player);
+
     vehicle->SetPosition(spawnPos.x, spawnPos.y, spawnPos.z);
     vehicle->SetHeading(HeadingRadians(anchor));
+
+    // CREATE_CAR clears the destination volume before the vehicle enters world sectors.
+    CTheScripts::ClearSpaceForMissionEntity(spawnPos, vehicle);
+
+    // Mirror VC's CREATE_CAR initialization (0x44A1F3) instead of inventing a
+    // trainer-specific lifetime scheme.  These writes are made before CWorld::Add.
+    vehicle->m_nState = 4;                 // STATUS_ABANDONED
+    vehicle->bIsLocked = true;             // script-owned: normal car cleanup must not remove it
+    vehicle->bRemoveFromWorld = false;
     vehicle->m_eDoorLock = DOORLOCK_UNLOCKED;
-    vehicle->bEngineOn = true;
+    vehicle->m_nZoneLevel =
+        static_cast<unsigned char>(CTheZones::GetLevelFromPosition(&spawnPos));
 
-    // Plugin-SDK's current VC name is still unknown, but this is the executable's
-    // flagsC bit 6: reVC identifies it as bStreamingDontDelete.  Combined with
-    // PERMANENT_VEHICLE this keeps trainer spawns out of both streaming and random
-    // traffic cleanup without pinning the vehicle model globally.
-    vehicle->bEntUFlag23 = true;
+    // CREATE_CAR sets the "owned by player" vehicle flag (CVehicle+0x1FB bit 2).
+    // Plugin-SDK 10/31/2025 still calls that bit b19.
+    vehicle->b19 = true;
 
+    // Match the opcode's neutral autopilot state.  Leaving road/path state half-initialised
+    // is a bad idea because the vehicle is processed immediately after CWorld::Add.
+    vehicle->m_autoPilot.m_nCarMission = MISSION_NONE;
+    vehicle->m_autoPilot.m_nAnimationId = TEMPACT_NONE;
+    vehicle->m_autoPilot.m_nCurrentLane = 0;
+    vehicle->m_autoPilot.m_nNextLane = 0;
+    vehicle->m_autoPilot.m_nDrivingStyle = DRIVINGSTYLE_STOP_FOR_CARS;
+
+    if (entry.kind == VehicleKind::Boat) {
+        vehicle->m_autoPilot.m_fMaxTrafficSpeed = 20.0f;
+        vehicle->m_autoPilot.m_nCruiseSpeed = 20;
+    } else {
+        vehicle->m_autoPilot.m_fMaxTrafficSpeed = 9.0f;
+        vehicle->m_autoPilot.m_nCruiseSpeed = 9;
+    }
+
+    // CREATE_CAR turns the engine off initially.  It starts normally when entered.
+    vehicle->bEngineOn = false;
     ZeroVelocity(vehicle);
+
+    if (entry.kind == VehicleKind::Bike) {
+        // CREATE_CAR sets CBike+0x484 bit 4 on script-created bikes.
+        static_cast<CBike*>(vehicle)->m_nDamageFlags |= 0x10;
+    }
+
+    // VC's CREATE_CAR joins road vehicles to the road system before adding them to world sectors.
+    if (entry.kind == VehicleKind::Automobile || entry.kind == VehicleKind::Bike)
+        CCarCtrl::JoinCarWithRoadSystem(vehicle);
+
     CWorld::Add(vehicle);
+
+    // Release only our temporary model request. The live entity now owns a model ref,
+    // while the vehicle itself remains mission-owned and script-locked.
+    if (!wasAlreadyRequested) {
+        CStreaming::SetModelIsDeletable(entry.model);
+        CStreaming::SetModelTxdIsDeletable(entry.model);
+    }
 
     char msg[96];
     std::snprintf(msg, sizeof(msg), "Spawned %s", entry.name);
@@ -1006,6 +1132,8 @@ static void ResetRuntimeState() {
     g.noReload = false;
     g.neverWanted = false;
     g.page = Page::Main;
+    gCaptureNativeVehicleCtor = false;
+    gCapturedNativeVehicle = nullptr;
     gPlayerProof = ProofSnapshot();
     gVehicleProof = VehicleProofSnapshot();
     for (AmmoSlotSnapshot& snap : gAmmo)
@@ -1024,9 +1152,15 @@ public:
         Events::gameProcessEvent += [] { Process(); };
         Events::drawHudEvent += [] { Draw(); };
 
+        Events::vehicleCtorEvent += [](CVehicle* vehicle) {
+            if (gCaptureNativeVehicleCtor)
+                gCapturedNativeVehicle = vehicle;
+        };
         Events::vehicleDtorEvent += [](CVehicle* vehicle) {
             if (gVehicleProof.valid && gVehicleProof.entity == vehicle)
                 gVehicleProof = VehicleProofSnapshot();
+            if (gCapturedNativeVehicle == vehicle)
+                gCapturedNativeVehicle = nullptr;
         };
         Events::pedDtorEvent += [](CPed* ped) {
             if (gPlayerProof.valid && gPlayerProof.entity == ped)
